@@ -1,212 +1,834 @@
-<style>
-.sr-only{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
-#ef-wrap{padding:6px 0;text-align:center}
-#ef-cv{max-width:100%;display:inline-block;border-radius:12px;touch-action:manipulation;cursor:crosshair;user-select:none;-webkit-user-select:none}
-</style>
-<h2 class="sr-only">Emberfall, a playable arcade game where you defend a forest from falling embers and spreading fire. Tap embers and beetles to swat them. A toolkit on the left lets you select tools: the default Water tool douses burning trees, wets healthy trees, and knocks down dead snags; Seed plants free trees; Climate plants fire- and beetle-resistant trees from a stock that refills over time; Line digs a firebreak that blocks fire spread; Beetle sprays verbenone to repel bark beetles from an area; and Air calls a retardant tanker once you have enough points. Dead snags breed beetle outbreaks, woodpeckers arrive to eat beetles, surviving trees reseed burned ground with cones, periodic rain suppresses fire, and the fire intensifies as time passes.</h2>
-<div id="ef-wrap">
-<canvas id="ef-cv" aria-label="Emberfall forest defense game"></canvas>
-</div>
-<script>
-(function(){
-"use strict";
-var cv=document.getElementById('ef-cv');
-var ctx=cv.getContext('2d');
-var parentW=(cv.parentElement&&cv.parentElement.clientWidth)||880;
-var W=Math.max(320,Math.min(920,parentW));
-var H=Math.round(Math.max(430,Math.min(560,W*0.6)));
-var DPR=Math.min(2,window.devicePixelRatio||1);
-cv.width=W*DPR;cv.height=H*DPR;cv.style.width=W+'px';cv.style.height=H+'px';
-var RAIL=64;
-
-function rnd(a,b){return a+Math.random()*(b-a);}
-function clamp(v,a,b){return v<a?a:(v>b?b:v);}
-function lerp(a,b,t){return a+(b-a)*t;}
-function mixc(c1,c2,t){t=clamp(t,0,1);return [Math.round(lerp(c1[0],c2[0],t)),Math.round(lerp(c1[1],c2[1],t)),Math.round(lerp(c1[2],c2[2],t))];}
-function scl(c,f){return [Math.round(c[0]*f),Math.round(c[1]*f),Math.round(c[2]*f)];}
-function rgba(c,a){return 'rgba('+c[0]+','+c[1]+','+c[2]+','+a+')';}
-function roundRect(x,y,w,h,r){r=Math.min(r,w/2,h/2);if(r<0)r=0;ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
-
-function groundY(x){return H-58-22*Math.sin(x*0.005+1.2)-12*Math.sin(x*0.013+4.1);}
-
-var stars=[];
-for(var si=0;si<46;si++)stars.push({x:Math.random()*W,y:Math.random()*H*0.5,p:Math.random()*6.28});
-
-var PINE=[[44,94,56],[36,104,74],[58,110,52]];
-var trees=[];
-function addTreeAt(x,s,adapt){trees.push({x:x,gy:groundY(x),h:rnd(46,72),s:s,state:'alive',bt:0,ph:rnd(0,6.28),v:Math.floor(rnd(0,3)),sm:0,inf:0,cone:rnd(5,9),adapt:!!adapt,retard:0});}
-function initForest(){trees=[];var n=Math.round((W-RAIL)/52);var xs=[];var tries=0;
- while(xs.length<n&&tries<500){tries++;var x=rnd(RAIL+18,W-18);var ok=true;
-  for(var i=0;i<xs.length;i++){if(Math.abs(xs[i]-x)<34){ok=false;break;}}
-  if(ok)xs.push(x);}
- for(var j=0;j<xs.length;j++)addTreeAt(xs[j],rnd(0.55,1));}
-
-var state='menu',score=0,best=0,water=100,wind=0,windTarget=rnd(-0.5,0.5),elapsed=0,acc=0;
-var embers=[],parts=[],floats=[],beetles=[],cones=[],woodpeckers=[],lines=[],verbs=[],planes=[];
-var groundTool='water',toolBtns=[],airBtn=null;
-var adaptStock=0,airCD=0,adaptAcc=0;
-var cursor={x:W/2,y:H/2,on:false,touch:false};
-var rainT=rnd(18,26),rainDur=0,rainWarn=0;
-var spawnT=2.5,showerIn=rnd(20,30),showerWarn=0,pending=0,pendT=0;
-var beetleCheck=0,outbreakWarn=0,beetlePend=0,beetlePendT=0,wpCheck=0;
-var shake=0,doused=0,planted=0,swatted=0,reseeded=0,adaptPlanted=0,lineBuilt=0,sprayed=0,airdrops=0,muted=false;
-var WMAX=100,DOUSE=25,PLANT=30,REGEN=5.5,BURN=5.2;
-var SPREAD=0.42,BEETLE_R=90,INF_MAX=4,INF_RATE=0.16,CONE_R=120,CONE_EVERY=8;
-var WP_R=78,WP_CLEAN=1.5,WP_PECK=0.42,WP_STAY=7;
-var ADAPT_FR=0.6,ADAPT_REGEN=20,ADAPT_MAX=6,LINE_COST=18,LINE_DIG=3.5;
-var VERB_COST=25,VERB_R=78,VERB_TIME=75,RETARD_TIME=12;
-var AIR_UNLOCK=200,AIR_CD=45;
-var PICK_E=30,PICK_B=32,WET_COST=10,WET_TIME=5;
-var muteBox={x:0,y:0,w:0,h:0};
-
-var AC=null,master=null,noiseBuf=null;
-function audio(){try{
- if(!AC){var Ctor=window.AudioContext||window.webkitAudioContext;if(!Ctor)return;AC=new Ctor();master=AC.createGain();master.gain.value=0.32;master.connect(AC.destination);}
- if(AC.state==='suspended')AC.resume();
-}catch(err){}}
-function env(g,t0,a,d,peak){g.gain.setValueAtTime(0.0001,t0);g.gain.linearRampToValueAtTime(peak,t0+a);g.gain.exponentialRampToValueAtTime(0.0001,t0+a+d);}
-function tone(f0,f1,dur,type,vol){if(!AC||muted)return;try{var t=AC.currentTime;var o=AC.createOscillator();var g=AC.createGain();o.type=type;o.frequency.setValueAtTime(f0,t);o.frequency.exponentialRampToValueAtTime(Math.max(30,f1),t+dur);env(g,t,0.005,dur,vol);o.connect(g);g.connect(master);o.start(t);o.stop(t+dur+0.05);}catch(err){}}
-function noise(dur,vol,f0,f1,type){if(!AC||muted)return;try{
- if(!noiseBuf){var len=AC.sampleRate;noiseBuf=AC.createBuffer(1,len,AC.sampleRate);var d=noiseBuf.getChannelData(0);for(var i=0;i<len;i++)d[i]=Math.random()*2-1;}
- var t=AC.currentTime;var s=AC.createBufferSource();s.buffer=noiseBuf;s.loop=true;
- var f=AC.createBiquadFilter();f.type=type||'lowpass';f.frequency.setValueAtTime(f0,t);f.frequency.exponentialRampToValueAtTime(Math.max(40,f1),t+dur);
- var g=AC.createGain();env(g,t,0.01,dur,vol);s.connect(f);f.connect(g);g.connect(master);s.start(t);s.stop(t+dur+0.05);}catch(err){}}
-function sfxSplash(){noise(0.32,0.5,2600,260,'lowpass');}
-function sfxSwat(){noise(0.07,0.3,5000,2500,'highpass');tone(900,1400,0.06,'square',0.1);}
-function sfxIgnite(){noise(0.16,0.26,1000,420,'bandpass');}
-function sfxThud(){tone(120,40,0.32,'sine',0.5);noise(0.18,0.2,420,90,'lowpass');}
-function sfxPlant(){tone(320,180,0.14,'triangle',0.28);}
-function sfxGrow(){tone(620,930,0.13,'sine',0.18);tone(930,1240,0.13,'sine',0.1);}
-function sfxDeny(){tone(180,140,0.09,'square',0.14);}
-function sfxStart(){tone(392,392,0.1,'triangle',0.22);setTimeout(function(){tone(523,523,0.12,'triangle',0.22);},110);}
-function sfxOver(){tone(330,110,0.6,'sawtooth',0.16);}
-function sfxBeetle(){tone(220,140,0.3,'sawtooth',0.12);noise(0.25,0.12,1800,900,'bandpass');}
-function sfxCone(){tone(300,520,0.1,'triangle',0.14);noise(0.13,0.12,1300,400,'lowpass');}
-function sfxPeck(){if(!AC||muted)return;for(var i=0;i<4;i++){(function(k){setTimeout(function(){noise(0.03,0.26,4400,2600,'bandpass');tone(2700,1900,0.03,'square',0.06);},k*30);})(i);}}
-function sfxWing(){tone(160,120,0.18,'sine',0.06);}
-function sfxTick(){tone(520,640,0.05,'square',0.08);}
-function sfxRain(){noise(0.5,0.16,1200,300,'lowpass');}
-function sfxSpray(){noise(0.5,0.14,2600,1400,'bandpass');tone(680,520,0.18,'sine',0.05);}
-function sfxPlane(){tone(150,120,1.4,'sawtooth',0.07);noise(1.2,0.06,500,260,'lowpass');}
-
-function P(x,y,type){var p={x:x,y:y,type:type,t:0,vx:0,vy:0,life:0.3,r:2};
- if(type==='flame'){p.vx=rnd(-8,8);p.vy=rnd(-46,-26);p.life=rnd(0.35,0.6);p.r=rnd(3,6);}
- else if(type==='smoke'){p.vx=rnd(-6,6)+wind*18;p.vy=rnd(-22,-12);p.life=rnd(1.2,2.2);p.r=rnd(3,5);}
- else if(type==='drop'){var a=rnd(0,6.28);var sp=rnd(40,130);p.vx=Math.cos(a)*sp;p.vy=Math.sin(a)*sp-60;p.life=rnd(0.4,0.7);p.r=rnd(1.5,2.6);}
- else if(type==='spark'){var a2=rnd(0,6.28);var s2=rnd(60,150);p.vx=Math.cos(a2)*s2;p.vy=Math.sin(a2)*s2;p.life=rnd(0.18,0.32);p.r=rnd(1.2,2);}
- else if(type==='dirt'){p.vx=rnd(-50,50);p.vy=rnd(-90,-30);p.life=rnd(0.4,0.6);p.r=rnd(1.5,2.5);}
- else if(type==='frass'){p.vx=rnd(-10,10);p.vy=rnd(10,40);p.life=rnd(0.5,0.9);p.r=rnd(1,1.8);}
- else if(type==='needle'){p.vx=rnd(-46,46);p.vy=rnd(-78,-24);p.life=rnd(0.45,0.8);p.r=rnd(3,5);p.rot=rnd(0,6.28);}
- else if(type==='chip'){p.vx=rnd(-58,58);p.vy=rnd(-58,-12);p.life=rnd(0.3,0.6);p.r=rnd(1.2,2.4);}
- else if(type==='retard'){p.vx=rnd(-12,12);p.vy=rnd(40,120);p.life=rnd(0.7,1.3);p.r=rnd(2.5,4.5);}
- else if(type==='haze'){p.vx=rnd(-5,5);p.vy=rnd(-16,-6);p.life=rnd(0.9,1.6);p.r=rnd(3,6);}
- else if(type==='tail'){p.life=0.3;p.r=rnd(1,2);}
- else if(type==='ring'){p.life=0.35;p.r=4;}
- return p;}
-function burst(x,y,n,type){for(var i=0;i<n;i++)parts.push(P(x+rnd(-4,4),y+rnd(-4,4),type));}
-function splashAt(x,y){parts.push(P(x,y,'ring'));for(var i=0;i<14;i++)parts.push(P(x,y,'drop'));}
-function updParts(dt){for(var i=parts.length-1;i>=0;i--){var p=parts[i];p.t+=dt;
- if(p.t>=p.life){parts.splice(i,1);continue;}
- if(p.type==='drop'||p.type==='dirt')p.vy+=320*dt;
- if(p.type==='frass')p.vy+=140*dt;
- if(p.type==='needle')p.vy+=210*dt;
- if(p.type==='chip')p.vy+=260*dt;
- if(p.type==='retard')p.vy+=180*dt;
- if(p.type==='flame')p.vx+=wind*30*dt;
- if(p.type==='smoke'){p.vx+=wind*22*dt;p.r+=dt*7;}
- p.x+=p.vx*dt;p.y+=p.vy*dt;}}
-function updFloats(dt){for(var i=floats.length-1;i>=0;i--){var f=floats[i];f.t+=dt;f.y-=26*dt;if(f.t>0.95)floats.splice(i,1);}}
-function addScore(n,x,y){score+=n;floats.push({x:x,y:y,txt:'+'+n,t:0,col:'#eaf6d8'});}
-
-function ignite(t){if(t.state==='alive'){t.state='burning';t.bt=0;sfxIgnite();burst(t.x,t.gy-t.h*t.s*0.7,4,'flame');}}
-function douse(t){t.state='alive';t.bt=0;doused++;addScore(15,t.x,t.gy-t.h*t.s);splashAt(t.x,t.gy-t.h*t.s*0.6);sfxSplash();}
-function loseTree(t){t.state='burned';shake=9;sfxThud();burst(t.x,t.gy-20,10,'smoke');}
-function spawnEmber(){var x=clamp(rnd(RAIL+10,W-10)-wind*90,RAIL-30,W+30);
- embers.push({x:x,y:-12,vx:wind*55+rnd(-12,12),vy:rnd(34,58),r:rnd(2,3.4)});}
-function gameOver(){state='over';best=Math.max(best,score);sfxOver();}
-
-function snagCount(){var c=0;for(var i=0;i<trees.length;i++)if(trees[i].state==='burned')c++;return c;}
-function spawnBeetle(){
- var snags=[];for(var i=0;i<trees.length;i++)if(trees[i].state==='burned'&&!inVerb(trees[i].x))snags.push(trees[i]);
- var ox,oy;
- if(snags.length){var sn=snags[Math.floor(Math.random()*snags.length)];ox=sn.x+rnd(-10,10);oy=sn.gy-sn.h*0.3;}
- else{ox=rnd(RAIL+20,W-20);oy=groundY(ox)-20;}
- beetles.push({x:ox,y:oy,vx:rnd(-20,20),vy:rnd(-12,12),ph:rnd(0,6.28),target:-1,t:0});
-}
-function killBeetle(b,x,y){var idx=beetles.indexOf(b);if(idx>=0)beetles.splice(idx,1);
- swatted++;addScore(8,x,y);burst(x,y,7,'spark');sfxSwat();}
-function castCone(t){
- var ang=rnd(-0.5,0.5)+(Math.random()<0.5?-1:1)*1.2;
- var dist=rnd(50,CONE_R);
- var sign=Math.cos(ang)>=0?1:-1;
- var tx=clamp(t.x+sign*dist,RAIL+16,W-16);
- var oy=t.gy-t.h*t.s*rnd(0.55,0.85);
- var spd=rnd(70,105);
- cones.push({x:t.x+sign*4,y:oy,tx:tx,ty:groundY(tx),vx:sign*spd,vy:-rnd(150,200),t:0,life:rnd(2.6,3.8),rot:rnd(0,6.28),spin:rnd(-6,6)*sign});
- for(var n=0;n<4;n++)parts.push(P(t.x+sign*4,oy,'needle'));
- burst(t.x+sign*4,oy,2,'spark');
-}
-function buildLine(x){
- for(var i=0;i<lines.length;i++){if(Math.abs(lines[i].x-x)<16)return false;}
- for(var m=trees.length-1;m>=0;m--){if(trees[m].state==='burned'&&Math.abs(trees[m].x-x)<14){trees.splice(m,1);break;}}
- lines.push({x:x,dig:LINE_DIG,ready:false});burst(x,groundY(x)-2,8,'dirt');return true;
-}
-function updLines(dt){for(var i=0;i<lines.length;i++){var L=lines[i];if(!L.ready){L.dig-=dt;
- if(Math.random()<dt*5)parts.push(P(L.x+rnd(-8,8),groundY(L.x)-2,'dirt'));
- if(L.dig<=0){L.ready=true;burst(L.x,groundY(L.x)-2,5,'dirt');}}}}
-function lineBlocks(ax,bx){var lo=Math.min(ax,bx),hi=Math.max(ax,bx);
- for(var i=0;i<lines.length;i++){if(lines[i].ready&&lines[i].x>lo&&lines[i].x<hi)return true;}return false;}
-function inVerb(x){for(var i=0;i<verbs.length;i++){if(Math.abs(verbs[i].x-x)<verbs[i].r)return verbs[i];}return null;}
-function deployVerb(x){verbs.push({x:x,r:VERB_R,life:VERB_TIME,t:0});burst(x,groundY(x)-4,6,'haze');sfxSpray();}
-function updVerbs(dt){for(var i=verbs.length-1;i>=0;i--){var V=verbs[i];V.life-=dt;V.t+=dt;
- if(Math.random()<dt*4)parts.push(P(V.x+rnd(-V.r*0.7,V.r*0.7),groundY(V.x)-rnd(2,30),'haze'));
- if(V.life<=0)verbs.splice(i,1);}}
-function requestPlane(){
- if(score<AIR_UNLOCK){floats.push({x:RAIL+90,y:H*0.4,txt:'Air support: reach '+AIR_UNLOCK,t:0,col:'#9fd0ff'});sfxDeny();return;}
- if(airCD>0){floats.push({x:RAIL+90,y:H*0.4,txt:'Tanker refueling',t:0,col:'#9fd0ff'});sfxDeny();return;}
- if(planes.length>0)return;
- var dir=wind>=0?1:-1;
- planes.push({x:dir>0?RAIL-60:W+60,y:H*0.17,dir:dir,drop:0});
- airCD=AIR_CD;airdrops++;sfxPlane();
-}
-function updPlanes(dt){
- for(var i=planes.length-1;i>=0;i--){var pl=planes[i];
-  pl.x+=pl.dir*235*dt;
-  var overForest=pl.x>RAIL-10&&pl.x<W+10;
-  if(overForest){
-   for(var d=0;d<3;d++)parts.push(P(pl.x+rnd(-14,14),pl.y+10,'retard'));
-   for(var j=0;j<trees.length;j++){var t=trees[j];if(Math.abs(t.x-pl.x)<26){
-    if(t.state==='burning'){t.state='alive';t.bt=0;burst(t.x,t.gy-t.h*t.s*0.6,6,'retard');}
-    if(t.state==='alive')t.retard=Math.max(t.retard,RETARD_TIME);}}
-  }
-  if((pl.dir>0&&pl.x>W+60)||(pl.dir<0&&pl.x<RAIL-60))planes.splice(i,1);
- }
-}
-function nearestBeetle(x,y,rad){var best=null,bd=rad;for(var i=0;i<beetles.length;i++){var d=Math.hypot(beetles[i].x-x,beetles[i].y-y);if(d<bd){bd=d;best=beetles[i];}}return best;}
-function bestPerchTree(){
- var inf=null,infv=0,near=null,neard=1e9;
- for(var i=0;i<trees.length;i++){var t=trees[i];if(t.state!=='alive')continue;
-  if(t.inf>infv){infv=t.inf;inf=t;}
-  for(var j=0;j<beetles.length;j++){var d=Math.abs(beetles[j].x-t.x);if(d<neard){neard=d;near=t;}}}
- if(inf)return inf;
- if(near)return near;
- return null;
-}
-function spawnWoodpecker(){
- var t=bestPerchTree();if(!t)return;
- var fromLeft=t.x<W/2?false:true;
- var sx=fromLeft?W+24:-24;
- var sy=rnd(40,H*0.4);
- woodpeckers.push({x:sx,y:sy,vx:0,vy:0,state:'flying',t:t,stay:rnd(WP_STAY*0.8,WP_STAY*1.3),peckT:0.3,ph:rnd(0,6.28),ex:0,ey:0,jab:0});
- floats.push({x:clamp(t.x,40,W-40),y:H*0.32,txt:'Black-backed woodpecker',t:0,col:'#ffe7a8'});
- sfxWing();
-}
-function pickExit(w){w.ex=w.x<W/2?-30:W+30;w.ey=rnd(30,H*0.35);w.state='leaving';}
-function updWoodpeckers(dt){
- for(var i=woodpeckers.length-1;i>=0;i--){var w=woodpeckers[i];w.ph+=dt*16;
-  if(w.state==='flying'){
-   if(!w.t||w.t.state!=='alive'){var nt=bestPerchTree();if(nt){w.t=nt;}else{pickExit(w);}}
-   if(w.state==='flying'&&w.t){
-    var px=w.t.x+(w.x<w.t.x?-1:1)*6;var py=w.t.gy-w.t.h*w.t.s*0.5;
-    var dx=px-w.x,dy=py-w.y,dd=Math.hypot(dx,dy)||1;
-    w.vx+=(dx/dd)*260*dt;w.vy+=(dy/dd)*260
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html>
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+  <meta http-equiv="Content-Style-Type" content="text/css">
+  <title></title>
+  <meta name="Generator" content="Cocoa HTML Writer">
+  <meta name="CocoaVersion" content="2575.7">
+  <style type="text/css">
+    p.p3 {margin: 0.0px 0.0px 0.0px 0.0px; text-align: center; font: 12.0px Times; -webkit-text-stroke: #000000; min-height: 14.0px}
+    span.s1 {font-kerning: none}
+  </style>
+</head>
+<body>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>&lt;style&gt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>.sr-only{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>#ef-wrap{padding:6px 0;text-align:center}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>#ef-cv{max-width:100%;display:inline-block;border-radius:12px;touch-action:manipulation;cursor:none;user-select:none;-webkit-user-select:none}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>&lt;/style&gt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>&lt;h2 class="sr-only"&gt;Emberfall, a playable arcade game where you defend a forest from falling embers and spreading fire. Tap embers and beetles to swat them. A toolkit on the left lets you select tools: Water douses burning trees and knocks down dead snags; Seed plants regular seedlings; Climate plants fire- and beetle-resistant seedlings from a stock that refills over time; Line digs a firebreak; Beetle sprays verbenone to repel bark beetles from an area; and Air calls a retardant tanker once you have enough points. Dead snags breed beetle outbreaks, woodpeckers arrive to eat beetles, surviving trees reseed burned ground with cones, periodic rain suppresses fire, and the fire intensifies as time passes.&lt;/h2&gt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>&lt;div id="ef-wrap"&gt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>&lt;canvas id="ef-cv" aria-label="Emberfall forest defense game"&gt;&lt;/canvas&gt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>&lt;/div&gt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>&lt;script&gt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>(function(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>"use strict";</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var cv=document.getElementById('ef-cv');</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var ctx=cv.getContext('2d');</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var parentW=(cv.parentElement&amp;&amp;cv.parentElement.clientWidth)||880;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var W=Math.max(320,Math.min(920,parentW));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var H=Math.round(Math.max(430,Math.min(560,W*0.6)));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var DPR=Math.min(2,window.devicePixelRatio||1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>cv.width=W*DPR;cv.height=H*DPR;cv.style.width=W+'px';cv.style.height=H+'px';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var RAIL=64;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function rnd(a,b){return a+Math.random()*(b-a);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function clamp(v,a,b){return v&lt;a?a:(v&gt;b?b:v);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function lerp(a,b,t){return a+(b-a)*t;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function mixc(c1,c2,t){t=clamp(t,0,1);return [Math.round(lerp(c1[0],c2[0],t)),Math.round(lerp(c1[1],c2[1],t)),Math.round(lerp(c1[2],c2[2],t))];}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function scl(c,f){return [Math.round(c[0]*f),Math.round(c[1]*f),Math.round(c[2]*f)];}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function rgba(c,a){return 'rgba('+c[0]+','+c[1]+','+c[2]+','+a+')';}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function roundRect(x,y,w,h,r){r=Math.min(r,w/2,h/2);if(r&lt;0)r=0;ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function groundY(x){return H-58-22*Math.sin(x*0.005+1.2)-12*Math.sin(x*0.013+4.1);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var stars=[];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>for(var si=0;si&lt;46;si++)stars.push({x:Math.random()*W,y:Math.random()*H*0.5,p:Math.random()*6.28});</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var PINE=[[44,94,56],[36,104,74],[58,110,52]];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var trees=[];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function addTreeAt(x,s,adapt){trees.push({x:x,gy:groundY(x),h:rnd(46,72),s:s,state:'alive',bt:0,ph:rnd(0,6.28),v:Math.floor(rnd(0,3)),sm:0,inf:0,cone:rnd(5,9),adapt:!!adapt,retard:0});}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function initForest(){trees=[];var n=Math.round((W-RAIL)/52);var xs=[];var tries=0;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>while(xs.length&lt;n&amp;&amp;tries&lt;500){tries++;var x=rnd(RAIL+18,W-18);var ok=true;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>for(var i=0;i&lt;xs.length;i++){if(Math.abs(xs[i]-x)&lt;34){ok=false;break;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(ok)xs.push(x);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var j=0;j&lt;xs.length;j++)addTreeAt(xs[j],rnd(0.55,1));}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var state='menu',score=0,best=0,water=100,wind=0,windTarget=rnd(-0.5,0.5),elapsed=0,acc=0;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var embers=[],parts=[],floats=[],beetles=[],cones=[],woodpeckers=[],lines=[],verbs=[],planes=[];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var groundTool='water',toolBtns=[];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var adaptStock=2,airCD=0,adaptAcc=0;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var cursor={x:W/2,y:H/2,on:false,touch:false};</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var rainT=rnd(18,26),rainDur=0,rainWarn=0;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var spawnT=2.5,showerIn=rnd(20,30),showerWarn=0,pending=0,pendT=0;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var beetleCheck=0,outbreakWarn=0,beetlePend=0,beetlePendT=0,wpCheck=0;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var shake=0,doused=0,planted=0,swatted=0,reseeded=0,adaptPlanted=0,lineBuilt=0,sprayed=0,airdrops=0,muted=false;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var WMAX=100,DOUSE=25,PLANT=30,REGEN=5.5,BURN=5.2;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var SPREAD=0.42,BEETLE_R=90,INF_MAX=4,INF_RATE=0.16,CONE_R=120,CONE_EVERY=8;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var WP_R=78,WP_CLEAN=1.5,WP_PECK=0.42,WP_STAY=7;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var ADAPT_FR=0.6,ADAPT_REGEN=20,ADAPT_MAX=6,LINE_COST=18,LINE_DIG=3.5;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var VERB_COST=25,VERB_R=78,VERB_TIME=75,RETARD_TIME=12;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var AIR_UNLOCK=200,AIR_CD=45;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var PICK_E=30,PICK_B=32,WET_COST=10;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var muteBox={x:0,y:0,w:0,h:0};</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var AC=null,master=null,noiseBuf=null;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function audio(){try{</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(!AC){var Ctor=window.AudioContext||window.webkitAudioContext;if(!Ctor)return;AC=new Ctor();master=AC.createGain();master.gain.value=0.32;master.connect(AC.destination);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(AC.state==='suspended')AC.resume();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}catch(err){}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function env(g,t0,a,d,peak){g.gain.setValueAtTime(0.0001,t0);g.gain.linearRampToValueAtTime(peak,t0+a);g.gain.exponentialRampToValueAtTime(0.0001,t0+a+d);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function tone(f0,f1,dur,type,vol){if(!AC||muted)return;try{var t=AC.currentTime;var o=AC.createOscillator();var g=AC.createGain();o.type=type;o.frequency.setValueAtTime(f0,t);o.frequency.exponentialRampToValueAtTime(Math.max(30,f1),t+dur);env(g,t,0.005,dur,vol);o.connect(g);g.connect(master);o.start(t);o.stop(t+dur+0.05);}catch(err){}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function noise(dur,vol,f0,f1,type){if(!AC||muted)return;try{</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(!noiseBuf){var len=AC.sampleRate;noiseBuf=AC.createBuffer(1,len,AC.sampleRate);var d=noiseBuf.getChannelData(0);for(var i=0;i&lt;len;i++)d[i]=Math.random()*2-1;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var t=AC.currentTime;var s=AC.createBufferSource();s.buffer=noiseBuf;s.loop=true;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var f=AC.createBiquadFilter();f.type=type||'lowpass';f.frequency.setValueAtTime(f0,t);f.frequency.exponentialRampToValueAtTime(Math.max(40,f1),t+dur);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var g=AC.createGain();env(g,t,0.01,dur,vol);s.connect(f);f.connect(g);g.connect(master);s.start(t);s.stop(t+dur+0.05);}catch(err){}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxSplash(){noise(0.32,0.5,2600,260,'lowpass');}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxSwat(){noise(0.07,0.3,5000,2500,'highpass');tone(900,1400,0.06,'square',0.1);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxIgnite(){noise(0.16,0.26,1000,420,'bandpass');}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxThud(){tone(120,40,0.32,'sine',0.5);noise(0.18,0.2,420,90,'lowpass');}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxPlant(){tone(320,180,0.14,'triangle',0.28);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxGrow(){tone(620,930,0.13,'sine',0.18);tone(930,1240,0.13,'sine',0.1);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxDeny(){tone(180,140,0.09,'square',0.14);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxStart(){tone(392,392,0.1,'triangle',0.22);setTimeout(function(){tone(523,523,0.12,'triangle',0.22);},110);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxOver(){tone(330,110,0.6,'sawtooth',0.16);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxBeetle(){tone(220,140,0.3,'sawtooth',0.12);noise(0.25,0.12,1800,900,'bandpass');}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxCone(){tone(300,520,0.1,'triangle',0.14);noise(0.13,0.12,1300,400,'lowpass');}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxPeck(){if(!AC||muted)return;for(var i=0;i&lt;4;i++){(function(k){setTimeout(function(){noise(0.03,0.26,4400,2600,'bandpass');tone(2700,1900,0.03,'square',0.06);},k*30);})(i);}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxWing(){tone(160,120,0.18,'sine',0.06);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxTick(){tone(520,640,0.05,'square',0.08);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxRain(){noise(0.5,0.16,1200,300,'lowpass');}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxSpray(){noise(0.5,0.14,2600,1400,'bandpass');tone(680,520,0.18,'sine',0.05);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function sfxPlane(){tone(150,120,1.4,'sawtooth',0.07);noise(1.2,0.06,500,260,'lowpass');}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function P(x,y,type){var p={x:x,y:y,type:type,t:0,vx:0,vy:0,life:0.3,r:2};</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(type==='flame'){p.vx=rnd(-8,8);p.vy=rnd(-46,-26);p.life=rnd(0.35,0.6);p.r=rnd(3,6);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='smoke'){p.vx=rnd(-6,6)+wind*18;p.vy=rnd(-22,-12);p.life=rnd(1.2,2.2);p.r=rnd(3,5);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='drop'){var a=rnd(0,6.28);var sp=rnd(40,130);p.vx=Math.cos(a)*sp;p.vy=Math.sin(a)*sp-60;p.life=rnd(0.4,0.7);p.r=rnd(1.5,2.6);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='spark'){var a2=rnd(0,6.28);var s2=rnd(60,150);p.vx=Math.cos(a2)*s2;p.vy=Math.sin(a2)*s2;p.life=rnd(0.18,0.32);p.r=rnd(1.2,2);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='dirt'){p.vx=rnd(-50,50);p.vy=rnd(-90,-30);p.life=rnd(0.4,0.6);p.r=rnd(1.5,2.5);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='frass'){p.vx=rnd(-10,10);p.vy=rnd(10,40);p.life=rnd(0.5,0.9);p.r=rnd(1,1.8);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='needle'){p.vx=rnd(-46,46);p.vy=rnd(-78,-24);p.life=rnd(0.45,0.8);p.r=rnd(3,5);p.rot=rnd(0,6.28);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='chip'){p.vx=rnd(-58,58);p.vy=rnd(-58,-12);p.life=rnd(0.3,0.6);p.r=rnd(1.2,2.4);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='retard'){p.vx=rnd(-12,12);p.vy=rnd(40,120);p.life=rnd(0.7,1.3);p.r=rnd(2.5,4.5);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='haze'){p.vx=rnd(-5,5);p.vy=rnd(-16,-6);p.life=rnd(0.9,1.6);p.r=rnd(3,6);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='tail'){p.life=0.3;p.r=rnd(1,2);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else if(type==='ring'){p.life=0.35;p.r=4;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>return p;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function burst(x,y,n,type){for(var i=0;i&lt;n;i++)parts.push(P(x+rnd(-4,4),y+rnd(-4,4),type));}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function splashAt(x,y){parts.push(P(x,y,'ring'));for(var i=0;i&lt;14;i++)parts.push(P(x,y,'drop'));}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function updParts(dt){for(var i=parts.length-1;i&gt;=0;i--){var p=parts[i];p.t+=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(p.t&gt;=p.life){parts.splice(i,1);continue;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(p.type==='drop'||p.type==='dirt')p.vy+=320*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(p.type==='frass')p.vy+=140*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(p.type==='needle')p.vy+=210*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(p.type==='chip')p.vy+=260*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(p.type==='retard')p.vy+=180*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(p.type==='flame')p.vx+=wind*30*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(p.type==='smoke'){p.vx+=wind*22*dt;p.r+=dt*7;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>p.x+=p.vx*dt;p.y+=p.vy*dt;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function updFloats(dt){for(var i=floats.length-1;i&gt;=0;i--){var f=floats[i];f.t+=dt;f.y-=26*dt;if(f.t&gt;0.95)floats.splice(i,1);}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function addScore(n,x,y){score+=n;floats.push({x:x,y:y,txt:'+'+n,t:0,col:'#eaf6d8'});}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function ignite(t){if(t.state==='alive'){t.state='burning';t.bt=0;sfxIgnite();burst(t.x,t.gy-t.h*t.s*0.7,4,'flame');}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function douse(t){t.state='alive';t.bt=0;doused++;addScore(15,t.x,t.gy-t.h*t.s);splashAt(t.x,t.gy-t.h*t.s*0.6);sfxSplash();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function loseTree(t){t.state='burned';shake=9;sfxThud();burst(t.x,t.gy-20,10,'smoke');}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function spawnEmber(){var x=clamp(rnd(RAIL+10,W-10)-wind*90,RAIL-30,W+30);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>embers.push({x:x,y:-12,vx:wind*55+rnd(-12,12),vy:rnd(34,58),r:rnd(2,3.4)});}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function gameOver(){state='over';best=Math.max(best,score);sfxOver();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function snagCount(){var c=0;for(var i=0;i&lt;trees.length;i++)if(trees[i].state==='burned')c++;return c;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function spawnBeetle(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var snags=[];for(var i=0;i&lt;trees.length;i++)if(trees[i].state==='burned'&amp;&amp;!inVerb(trees[i].x))snags.push(trees[i]);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var ox,oy;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(snags.length){var sn=snags[Math.floor(Math.random()*snags.length)];ox=sn.x+rnd(-10,10);oy=sn.gy-sn.h*0.3;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else{ox=rnd(RAIL+20,W-20);oy=groundY(ox)-20;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>beetles.push({x:ox,y:oy,vx:rnd(-20,20),vy:rnd(-12,12),ph:rnd(0,6.28),target:-1,t:0});</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function killBeetle(b,x,y){var idx=beetles.indexOf(b);if(idx&gt;=0)beetles.splice(idx,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>swatted++;addScore(8,x,y);burst(x,y,7,'spark');sfxSwat();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function castCone(t){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var ang=rnd(-0.5,0.5)+(Math.random()&lt;0.5?-1:1)*1.2;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var dist=rnd(50,CONE_R);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var sign=Math.cos(ang)&gt;=0?1:-1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var tx=clamp(t.x+sign*dist,RAIL+16,W-16);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var oy=t.gy-t.h*t.s*rnd(0.55,0.85);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var spd=rnd(70,105);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>cones.push({x:t.x+sign*4,y:oy,tx:tx,ty:groundY(tx),vx:sign*spd,vy:-rnd(150,200),t:0,life:rnd(2.6,3.8),rot:rnd(0,6.28),spin:rnd(-6,6)*sign});</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var n=0;n&lt;4;n++)parts.push(P(t.x+sign*4,oy,'needle'));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>burst(t.x+sign*4,oy,2,'spark');</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function buildLine(x){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;lines.length;i++){if(Math.abs(lines[i].x-x)&lt;16)return false;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var m=trees.length-1;m&gt;=0;m--){if(trees[m].state==='burned'&amp;&amp;Math.abs(trees[m].x-x)&lt;14){trees.splice(m,1);break;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>lines.push({x:x,dig:LINE_DIG,ready:false});burst(x,groundY(x)-2,8,'dirt');return true;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function updLines(dt){for(var i=0;i&lt;lines.length;i++){var L=lines[i];if(!L.ready){L.dig-=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(Math.random()&lt;dt*5)parts.push(P(L.x+rnd(-8,8),groundY(L.x)-2,'dirt'));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(L.dig&lt;=0){L.ready=true;burst(L.x,groundY(L.x)-2,5,'dirt');}}}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function lineBlocks(ax,bx){var lo=Math.min(ax,bx),hi=Math.max(ax,bx);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;lines.length;i++){if(lines[i].ready&amp;&amp;lines[i].x&gt;lo&amp;&amp;lines[i].x&lt;hi)return true;}return false;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function inVerb(x){for(var i=0;i&lt;verbs.length;i++){if(Math.abs(verbs[i].x-x)&lt;verbs[i].r)return verbs[i];}return null;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function deployVerb(x){verbs.push({x:x,r:VERB_R,life:VERB_TIME,t:0});sprayed++;burst(x,groundY(x)-4,6,'haze');sfxSpray();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function updVerbs(dt){for(var i=verbs.length-1;i&gt;=0;i--){var V=verbs[i];V.life-=dt;V.t+=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(Math.random()&lt;dt*4)parts.push(P(V.x+rnd(-V.r*0.7,V.r*0.7),groundY(V.x)-rnd(2,30),'haze'));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(V.life&lt;=0)verbs.splice(i,1);}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function requestPlane(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(score&lt;AIR_UNLOCK){floats.push({x:RAIL+110,y:H*0.4,txt:'Air support: reach '+AIR_UNLOCK,t:0,col:'#9fd0ff'});sfxDeny();return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(airCD&gt;0){floats.push({x:RAIL+110,y:H*0.4,txt:'Tanker refueling',t:0,col:'#9fd0ff'});sfxDeny();return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(planes.length&gt;0)return;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var dir=wind&gt;=0?1:-1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>planes.push({x:dir&gt;0?RAIL-60:W+60,y:H*0.17,dir:dir});</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>airCD=AIR_CD;airdrops++;sfxPlane();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function updPlanes(dt){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=planes.length-1;i&gt;=0;i--){var pl=planes[i];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>pl.x+=pl.dir*235*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var overForest=pl.x&gt;RAIL-10&amp;&amp;pl.x&lt;W+10;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(overForest){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>for(var d=0;d&lt;3;d++)parts.push(P(pl.x+rnd(-14,14),pl.y+10,'retard'));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>for(var j=0;j&lt;trees.length;j++){var t=trees[j];if(Math.abs(t.x-pl.x)&lt;28){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(t.state==='burning'){t.state='alive';t.bt=0;burst(t.x,t.gy-t.h*t.s*0.6,6,'retard');}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(t.state==='alive')t.retard=Math.max(t.retard,RETARD_TIME);}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if((pl.dir&gt;0&amp;&amp;pl.x&gt;W+60)||(pl.dir&lt;0&amp;&amp;pl.x&lt;RAIL-60))planes.splice(i,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function nearestBeetle(x,y,rad){var best=null,bd=rad;for(var i=0;i&lt;beetles.length;i++){var d=Math.hypot(beetles[i].x-x,beetles[i].y-y);if(d&lt;bd){bd=d;best=beetles[i];}}return best;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function bestPerchTree(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var inf=null,infv=0,near=null,neard=1e9;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;trees.length;i++){var t=trees[i];if(t.state!=='alive')continue;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(t.inf&gt;infv){infv=t.inf;inf=t;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>for(var j=0;j&lt;beetles.length;j++){var d=Math.abs(beetles[j].x-t.x);if(d&lt;neard){neard=d;near=t;}}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(inf)return inf;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(near)return near;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>return null;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function spawnWoodpecker(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var t=bestPerchTree();if(!t)return;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var fromLeft=t.x&lt;W/2?false:true;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var sx=fromLeft?W+24:-24;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var sy=rnd(40,H*0.4);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>woodpeckers.push({x:sx,y:sy,vx:0,vy:0,state:'flying',t:t,stay:rnd(WP_STAY*0.8,WP_STAY*1.3),peckT:0.3,ph:rnd(0,6.28),ex:0,ey:0,jab:0});</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>floats.push({x:clamp(t.x,40,W-40),y:H*0.32,txt:'Black-backed woodpecker',t:0,col:'#ffe7a8'});</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>sfxWing();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function pickExit(w){w.ex=w.x&lt;W/2?-30:W+30;w.ey=rnd(30,H*0.35);w.state='leaving';}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function updWoodpeckers(dt){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=woodpeckers.length-1;i&gt;=0;i--){var w=woodpeckers[i];w.ph+=dt*16;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(w.state==='flying'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(!w.t||w.t.state!=='alive'){var nt=bestPerchTree();if(nt){w.t=nt;}else{pickExit(w);}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(w.state==='flying'&amp;&amp;w.t){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>var px=w.t.x+(w.x&lt;w.t.x?-1:1)*6;var py=w.t.gy-w.t.h*w.t.s*0.5;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>var dx=px-w.x,dy=py-w.y,dd=Math.hypot(dx,dy)||1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>w.vx+=(dx/dd)*260*dt;w.vy+=(dy/dd)*260*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>w.vx*=0.9;w.vy*=0.9;w.x+=w.vx*dt;w.y+=w.vy*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(dd&lt;12){w.state='perched';w.side=(w.x&lt;w.t.x?-1:1);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>} else if(w.state==='perched'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(!w.t||w.t.state!=='alive'){pickExit(w);continue;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>w.stay-=dt;w.peckT-=dt;w.work=(w.work||0)+dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>var bob=Math.sin(w.ph*0.4)*1.2;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>w.jab=Math.max(0,w.jab-dt*8);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>w.px=w.t.x+w.side*5;w.py=w.t.gy-w.t.h*w.t.s*0.5+bob;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(w.t.inf&gt;0){w.t.inf=Math.max(0,w.t.inf-WP_CLEAN*dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(Math.random()&lt;dt*6)parts.push(P(w.px,w.py+rnd(-6,6),'chip'));}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(w.peckT&lt;=0){w.peckT=WP_PECK;w.jab=1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>var b=nearestBeetle(w.px,w.py,WP_R);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(b){var bx=b.x,by=b.y;var idx=beetles.indexOf(b);if(idx&gt;=0)beetles.splice(idx,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>addScore(2,bx,by);burst(bx,by,5,'spark');burst(w.px,w.py,3,'chip');sfxPeck();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>else{parts.push(P(w.px,w.py,'chip'));}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>var noWork=(w.t.inf&lt;=0)&amp;&amp;(nearestBeetle(w.px,w.py,WP_R+30)===null);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(w.stay&lt;=0||(noWork&amp;&amp;w.work&gt;2.6))pickExit(w);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>} else {</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>var ddx=w.ex-w.x,ddy=w.ey-w.y,dd2=Math.hypot(ddx,ddy)||1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>w.vx+=(ddx/dd2)*240*dt;w.vy+=(ddy/dd2)*240*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>w.vx*=0.92;w.vy*=0.92;w.x+=w.vx*dt;w.y+=w.vy*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(w.x&lt;-28||w.x&gt;W+28)woodpeckers.splice(i,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function updBeetles(dt){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=beetles.length-1;i&gt;=0;i--){var b=beetles[i];b.t+=dt;b.ph+=dt*9;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var repel=inVerb(b.x);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(repel){var rx=b.x-repel.x,rd=Math.abs(rx)||1;b.vx+=(rx/rd)*95*dt;b.vy-=12*dt;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var tgt=null,bestd=1e9;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>for(var j=0;j&lt;trees.length;j++){var t=trees[j];if(t.state!=='alive'||inVerb(t.x))continue;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>var d=Math.hypot(t.x-b.x,(t.gy-t.h*0.5)-b.y);if(d&lt;bestd){bestd=d;tgt=t;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(tgt){var dx=tgt.x-b.x,dy=(tgt.gy-tgt.h*0.5)-b.y;var dd=Math.hypot(dx,dy)||1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>b.vx+=(dx/dd)*42*dt;b.vy+=(dy/dd)*42*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(dd&lt;14){tgt.inf=Math.min(INF_MAX,tgt.inf+INF_RATE*dt*3*(tgt.adapt?0.45:1));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(Math.random()&lt;dt*4)parts.push(P(tgt.x+rnd(-6,6),tgt.gy-tgt.h*tgt.s*rnd(0.3,0.9),'frass'));}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>b.vx*=0.94;b.vy*=0.94;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>b.vx=clamp(b.vx,-60,60);b.vy=clamp(b.vy,-60,60);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>b.x+=b.vx*dt;b.y+=b.vy*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var gyb=groundY(b.x);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(b.y&gt;gyb-2){b.y=gyb-2;b.vy=-Math.abs(b.vy)*0.4;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(b.y&lt;14){b.y=14;b.vy=Math.abs(b.vy);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>b.x=clamp(b.x,RAIL+8,W-8);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function updCones(dt){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=cones.length-1;i&gt;=0;i--){var s=cones[i];s.t+=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>s.vy+=300*dt;s.rot+=s.spin*dt;s.x+=s.vx*dt;s.y+=s.vy*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(Math.random()&lt;dt*8)parts.push(P(s.x,s.y,'needle'));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(s.y&gt;=s.ty-2){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>var ok=true;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>for(var n=0;n&lt;trees.length;n++){if(trees[n].state!=='burned'&amp;&amp;Math.abs(trees[n].x-s.x)&lt;24){ok=false;break;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(ok&amp;&amp;s.x&gt;RAIL+14&amp;&amp;s.x&lt;W-14){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>for(var m=trees.length-1;m&gt;=0;m--){if(trees[m].state==='burned'&amp;&amp;Math.abs(trees[m].x-s.x)&lt;22){trees.splice(m,1);break;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>addTreeAt(s.x,0.08);reseeded++;burst(s.x,s.ty-2,6,'dirt');burst(s.x,s.ty-4,3,'needle');</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>} else {burst(s.x,s.ty-2,3,'needle');}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>cones.splice(i,1);continue;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(s.t&gt;s.life){cones.splice(i,1);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function reset(){initForest();embers=[];parts=[];floats=[];beetles=[];cones=[];woodpeckers=[];lines=[];verbs=[];planes=[];score=0;acc=0;water=WMAX;elapsed=0;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>spawnT=2.5;showerIn=rnd(20,30);showerWarn=0;pending=0;pendT=0;doused=0;planted=0;swatted=0;reseeded=0;adaptPlanted=0;lineBuilt=0;sprayed=0;airdrops=0;shake=0;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>adaptStock=2;adaptAcc=0;airCD=0;beetleCheck=0;outbreakWarn=0;beetlePend=0;beetlePendT=0;wpCheck=0;rainT=rnd(18,26);rainDur=0;rainWarn=0;groundTool='water';state='play';sfxStart();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function ambient(dt){updParts(dt);updFloats(dt);shake=Math.max(0,shake-dt*22);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function update(dt){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(Math.random()&lt;dt/6)windTarget=rnd(-0.85,0.85);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>wind+=(windTarget-wind)*dt*0.4;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(state!=='play'){ambient(dt);return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>elapsed+=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>water=Math.min(WMAX,water+(rainDur&gt;0?REGEN*2.6:REGEN)*dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(airCD&gt;0)airCD=Math.max(0,airCD-dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(adaptStock&lt;ADAPT_MAX){adaptAcc+=dt;if(adaptAcc&gt;=ADAPT_REGEN){adaptAcc=0;adaptStock++;floats.push({x:RAIL+110,y:82,txt:'Climate seedling ready',t:0,col:'#8fe0d0'});}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var live=0,burning=0;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;trees.length;i++){var t=trees[i];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(t.state==='alive'){live++;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(t.retard&gt;0)t.retard=Math.max(0,t.retard-dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(t.s&lt;1){t.s+=dt/(t.adapt?8:12);if(t.s&gt;=1){t.s=1;addScore(10,t.x,t.gy-t.h);sfxGrow();burst(t.x,t.gy-t.h*0.8,5,'spark');}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(t.inf&gt;0){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>t.inf-=dt*(t.adapt?0.32:0.18);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(t.inf&lt;0)t.inf=0;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(t.inf&gt;=INF_MAX){t.state='burned';t.sm=0;t.inf=0;shake=7;sfxThud();burst(t.x,t.gy-20,8,'frass');continue;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(Math.random()&lt;dt*t.inf*1.2)parts.push(P(t.x+rnd(-7,7),t.gy-t.h*t.s*rnd(0.3,0.9),'frass'));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(t.s&gt;=1){t.cone-=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(t.cone&lt;=0){t.cone=rnd(CONE_EVERY*0.7,CONE_EVERY*1.3);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>if(cones.length&lt;32){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">      </span>var snagNear=false;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">      </span>for(var sj=0;sj&lt;trees.length;sj++){if(trees[sj].state==='burned'&amp;&amp;Math.abs(trees[sj].x-t.x)&lt;CONE_R){snagNear=true;break;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">      </span>var nthrow=2+(snagNear?1:0);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">      </span>for(var cc=0;cc&lt;nthrow;cc++)castCone(t);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">      </span>sfxCone();}}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>}else if(t.state==='burning'){burning++;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(t.retard&gt;0)t.retard=Math.max(0,t.retard-dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>t.bt+=dt*(t.adapt?0.55:1)*(t.retard&gt;0?0.45:1)*(rainDur&gt;0?0.5:1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(rainDur&gt;0&amp;&amp;Math.random()&lt;dt*0.4){t.state='alive';t.bt=0;burst(t.x,t.gy-t.h*t.s*0.6,7,'drop');continue;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(Math.random()&lt;dt*8)parts.push(P(t.x+rnd(-9,9)*t.s,t.gy-t.h*t.s*rnd(0.35,0.95),'flame'));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(Math.random()&lt;dt*5)parts.push(P(t.x+rnd(-6,6),t.gy-t.h*t.s,'smoke'));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>for(var j=0;j&lt;trees.length;j++){var o=trees[j];if(o.state!=='alive')continue;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>var dx=o.x-t.x;var d=Math.abs(dx);var R=92;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(d&gt;0&amp;&amp;d&lt;R){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>if(lineBlocks(t.x,o.x))continue;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>var dir=(dx*wind&gt;0)?(1+Math.abs(wind)*1.6):(1-Math.abs(wind)*0.5);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>var pr=SPREAD*dir*(1-d/R)*dt*(1+elapsed/170);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>if(t.adapt)pr*=0.55;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>if(t.retard&gt;0)pr*=0.45;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>if(o.adapt)pr*=(1-ADAPT_FR);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>if(o.retard&gt;0)pr*=0.35;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>if(rainDur&gt;0)pr*=0.25;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">     </span>if(Math.random()&lt;pr)ignite(o);}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(t.bt&gt;BURN)loseTree(t);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>}else{</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(t.sm&lt;6&amp;&amp;Math.random()&lt;dt*0.8){t.sm++;parts.push(P(t.x,t.gy-t.h*0.4,'smoke'));}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>acc+=live*dt*0.5;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(acc&gt;=1){var g=Math.floor(acc);score+=g;acc-=g;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(live+burning===0){gameOver();return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(rainDur&lt;=0){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>spawnT-=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var interval=lerp(3.4,0.5,clamp(elapsed/170,0,1));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(spawnT&lt;=0){spawnT=interval*rnd(0.7,1.3);spawnEmber();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>showerIn-=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(showerIn&lt;=0){showerIn=rnd(24,36);showerWarn=1.4;pending=3+Math.min(6,Math.floor(elapsed/40));pendT=0.9;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(showerWarn&gt;0)showerWarn-=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(pending&gt;0){pendT-=dt;if(pendT&lt;=0&amp;&amp;showerWarn&lt;=0.6){pendT=0.13;pending--;spawnEmber();}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var k=embers.length-1;k&gt;=0;k--){var e=embers[k];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>e.vx+=(wind*55-e.vx)*dt*0.8;e.x+=e.vx*dt;e.y+=e.vy*dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(Math.random()&lt;dt*10)parts.push(P(e.x,e.y,'tail'));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var hit=false;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>for(var m=0;m&lt;trees.length;m++){var tr=trees[m];if(tr.state!=='alive')continue;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>var hh=tr.h*tr.s;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>var top=tr.gy-hh,crownBot=tr.adapt?(tr.gy-hh*0.42):tr.gy,halfw=tr.adapt?hh*0.3:hh*0.38;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(Math.abs(e.x-tr.x)&lt;halfw&amp;&amp;e.y&gt;top&amp;&amp;e.y&lt;crownBot){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>var fire=true;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(tr.adapt&amp;&amp;Math.random()&lt;ADAPT_FR)fire=false;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(tr.retard&gt;0&amp;&amp;Math.random()&lt;0.8)fire=false;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(rainDur&gt;0&amp;&amp;Math.random()&lt;0.6)fire=false;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>if(fire)ignite(tr);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>hit=true;break;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(hit){embers.splice(k,1);continue;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(e.y&gt;groundY(e.x)-3){burst(e.x,e.y,2,'smoke');embers.splice(k,1);continue;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(e.x&lt;-44||e.x&gt;W+44)embers.splice(k,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>beetleCheck-=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(beetleCheck&lt;=0){beetleCheck=2.5;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(snagCount()&gt;=2&amp;&amp;beetles.length&lt;10&amp;&amp;beetlePend&lt;=0&amp;&amp;outbreakWarn&lt;=0){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>outbreakWarn=1.6;beetlePend=2+Math.min(4,Math.floor(snagCount()/2));beetlePendT=1.0;sfxBeetle();}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(outbreakWarn&gt;0)outbreakWarn-=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(beetlePend&gt;0){beetlePendT-=dt;if(beetlePendT&lt;=0&amp;&amp;outbreakWarn&lt;=0.7){beetlePendT=0.25;beetlePend--;spawnBeetle();}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>wpCheck-=dt;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(wpCheck&lt;=0){wpCheck=rnd(2.2,3.4);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var pressure=beetles.length;var anyInf=false;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>for(var wi=0;wi&lt;trees.length;wi++){if(trees[wi].state==='alive'&amp;&amp;trees[wi].inf&gt;0.5){anyInf=true;break;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if((pressure&gt;=2||(anyInf&amp;&amp;snagCount()&gt;=2))&amp;&amp;woodpeckers.length&lt;2){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>var chance=clamp(0.28+pressure*0.06,0,0.7);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(Math.random()&lt;chance)spawnWoodpecker();}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(rainDur&gt;0){rainDur-=dt;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else{</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(rainWarn&gt;0){rainWarn-=dt;if(rainWarn&lt;=0){rainDur=rnd(7,11);sfxRain();}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else{rainT-=dt;if(rainT&lt;=0){rainWarn=2.2;rainT=rnd(28,44);}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>updBeetles(dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>updWoodpeckers(dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>updVerbs(dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>updPlanes(dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>updCones(dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>updLines(dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>updParts(dt);updFloats(dt);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>shake=Math.max(0,shake-dt*22);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawRidge(base,amp,f,col,off){ctx.fillStyle=rgba(col,1);ctx.beginPath();ctx.moveTo(0,H);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var x=0;x&lt;=W;x+=8)ctx.lineTo(x,base-amp*Math.sin(x*f+off)-amp*0.6*Math.sin(x*f*2.7+off*1.7));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.lineTo(W,H);ctx.closePath();ctx.fill();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawTree(t,time,light){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var s=Math.max(0.12,t.s),hgt=t.h*s,x=t.x,gy=t.gy;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(t.state==='burned'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var tc=mixc(scl([96,86,76],0.35),[96,86,76],light);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.strokeStyle=rgba(tc,1);ctx.lineWidth=3;ctx.lineCap='round';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();ctx.moveTo(x,gy);ctx.lineTo(x,gy-hgt*0.62);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.lineWidth=2;ctx.beginPath();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.moveTo(x,gy-hgt*0.5);ctx.lineTo(x+hgt*0.16,gy-hgt*0.58);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.moveTo(x,gy-hgt*0.36);ctx.lineTo(x-hgt*0.15,gy-hgt*0.45);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>return;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var sway=Math.sin(time*1.7+t.ph)*(1.2+2.6*Math.abs(wind));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var trunkH=hgt*(t.adapt?0.46:0.3);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var tc2=mixc(scl([110,78,48],0.3),[110,78,48],light);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle=rgba(tc2,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillRect(x-1.5-s,gy-trunkH,3+2*s,trunkH+2);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var base=PINE[t.v];var col=mixc(scl(base,0.3),base,light);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(t.adapt)col=mixc(col,[64,116,120],0.42);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(t.retard&gt;0)col=mixc(col,[190,92,92],0.28);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(t.state==='burning'){var bm=clamp(t.bt/BURN,0,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>col=mixc(col,[235,120,35],clamp(bm*1.8,0,1));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(bm&gt;0.55)col=mixc(col,[42,34,28],(bm-0.55)/0.45*0.9);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(t.state==='alive'&amp;&amp;t.inf&gt;0)col=mixc(col,[150,72,40],clamp(t.inf/INF_MAX,0,0.85));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle=rgba(col,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var cbase=t.adapt?0.42:0.16;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var li=0;li&lt;3;li++){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var by=gy-hgt*(cbase+0.24*li);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var ty=by-hgt*0.36;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var hw=hgt*0.34*(1-0.24*li);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var tx=x+sway*(0.25+0.4*li);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();ctx.moveTo(tx,ty);ctx.lineTo(x-hw,by);ctx.lineTo(x+hw,by);ctx.closePath();ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(t.s&lt;1&amp;&amp;t.state==='alive'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var rr=4+2*(0.5+0.5*Math.sin(time*3+t.ph));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.strokeStyle='rgba(255,255,255,0.25)';ctx.lineWidth=1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();ctx.arc(x,gy-2,rr,0,6.29);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawBeetles(time){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;beetles.length;i++){var b=beetles[i];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var wig=Math.sin(b.ph)*1.5;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#2a1d12';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();ctx.ellipse(b.x,b.y,4.5,3,0,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#5a3a1f';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();ctx.ellipse(b.x-1,b.y-0.5,2.2,1.6,0,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.strokeStyle='#1a1109';ctx.lineWidth=0.8;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.moveTo(b.x-3,b.y-2+wig);ctx.lineTo(b.x-6,b.y-3+wig);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.moveTo(b.x-3,b.y);ctx.lineTo(b.x-6,b.y+wig);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.moveTo(b.x-3,b.y+2-wig);ctx.lineTo(b.x-6,b.y+3-wig);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.moveTo(b.x+3,b.y-2-wig);ctx.lineTo(b.x+6,b.y-3-wig);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.moveTo(b.x+3,b.y);ctx.lineTo(b.x+6,b.y+wig);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.moveTo(b.x+3,b.y+2+wig);ctx.lineTo(b.x+6,b.y+3+wig);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawCones(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;cones.length;i++){var s=cones[i];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.save();ctx.translate(s.x,s.y);ctx.rotate(s.rot);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#7a4f28';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();ctx.ellipse(0,0,3.2,5.4,0,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#5f3c1d';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>for(var r=-3;r&lt;=3;r++){var yy=r*1.45;var w=3.0*(1-Math.abs(yy)/7);if(w&lt;=0)continue;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.beginPath();ctx.moveTo(-w,yy);ctx.lineTo(0,yy+1.2);ctx.lineTo(w,yy);ctx.lineTo(0,yy-0.4);ctx.closePath();ctx.fill();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='rgba(196,150,96,0.5)';ctx.beginPath();ctx.ellipse(-1,-1.6,1,2,0,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.restore();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawWpFly(w){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var dir=w.vx&gt;=0?1:-1;ctx.save();ctx.translate(w.x,w.y);ctx.scale(dir,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var flap=Math.sin(w.ph)*0.9;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#0f0d09';ctx.save();ctx.rotate(-flap*0.6);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.beginPath();ctx.moveTo(-2,-1);ctx.lineTo(-11,-7-flap*4);ctx.lineTo(-3,-2);ctx.closePath();ctx.fill();ctx.restore();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#15120d';ctx.beginPath();ctx.ellipse(0,0,7,3.2,0,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#f0ece1';ctx.beginPath();ctx.ellipse(-1,1.4,4.4,1.7,0,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#15120d';ctx.beginPath();ctx.moveTo(-6,0);ctx.lineTo(-11,2);ctx.lineTo(-6,1.6);ctx.closePath();ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.beginPath();ctx.arc(6,-0.5,2.8,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#f2c200';ctx.beginPath();ctx.arc(6,-2.3,1.1,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.strokeStyle='#f0ece1';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(4.6,0.7);ctx.lineTo(7.6,0.5);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#b9b2a0';ctx.beginPath();ctx.moveTo(8.4,-0.5);ctx.lineTo(12,0.2);ctx.lineTo(8.4,0.9);ctx.closePath();ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.restore();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawWpPerch(w){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var f=-(w.side||1);var jab=(w.jab||0)*2.2;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.save();ctx.translate(w.px,w.py);ctx.scale(f,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.strokeStyle='#15120d';ctx.lineWidth=2;ctx.lineCap='round';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.beginPath();ctx.moveTo(-1.5,5);ctx.lineTo(-3,9.2);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#15120d';ctx.beginPath();ctx.ellipse(0,1,3,5.2,0,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#f0ece1';ctx.beginPath();ctx.ellipse(1.2,1.6,1.6,4.2,0,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.strokeStyle='#15120d';ctx.lineWidth=0.7;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var b=0;b&lt;3;b++){var yy=-1+b*2;ctx.beginPath();ctx.moveTo(0.5,yy);ctx.lineTo(2.6,yy);ctx.stroke();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var hx=1+jab,hy=-5;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#15120d';ctx.beginPath();ctx.arc(hx,hy,2.8,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#f2c200';ctx.beginPath();ctx.arc(hx-0.6,hy-1.9,1.1,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.strokeStyle='#f0ece1';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(hx-1.2,hy+0.9);ctx.lineTo(hx+1.4,hy+0.5);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#b9b2a0';ctx.beginPath();ctx.moveTo(hx+2.4,hy-0.4);ctx.lineTo(hx+5.6,hy+0.3);ctx.lineTo(hx+2.4,hy+0.9);ctx.closePath();ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.restore();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawWoodpeckers(){for(var i=0;i&lt;woodpeckers.length;i++){var w=woodpeckers[i];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(w.state==='perched')drawWpPerch(w);else drawWpFly(w);}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawLines(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;lines.length;i++){var L=lines[i];var gx=L.x,gy=groundY(gx);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(L.ready){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.fillStyle='#5a4226';roundRect(gx-9,gy-3,18,7,3);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.strokeStyle='#3a2a18';ctx.lineWidth=1;roundRect(gx-9,gy-3,18,7,3);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.strokeStyle='rgba(150,120,80,0.6)';ctx.lineWidth=1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.beginPath();ctx.moveTo(gx-6,gy);ctx.lineTo(gx-2,gy);ctx.moveTo(gx+1,gy+1);ctx.lineTo(gx+6,gy+1);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>} else {</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>var p=1-clamp(L.dig/LINE_DIG,0,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.fillStyle='rgba(110,86,52,'+(0.35+0.4*p)+')';roundRect(gx-9,gy-2,18*Math.max(0.15,p),6,3);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.strokeStyle='rgba(150,120,80,0.45)';ctx.setLineDash([2,3]);ctx.lineWidth=1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>roundRect(gx-9,gy-3,18,8,3);ctx.stroke();ctx.setLineDash([]);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawVerbs(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;verbs.length;i++){var V=verbs[i];var gy=groundY(V.x);var a=0.10+0.06*Math.sin(V.t*2);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='rgba(170,210,135,'+a+')';ctx.beginPath();ctx.ellipse(V.x,gy-18,V.r,24,0,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.strokeStyle='rgba(190,235,150,0.32)';ctx.lineWidth=1.5;ctx.beginPath();ctx.ellipse(V.x,gy-18,V.r,24,0,0,6.29);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawPlanes(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;planes.length;i++){var pl=planes[i];ctx.save();ctx.translate(pl.x,pl.y);ctx.scale(pl.dir,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#d7e1e8';roundRect(-17,-5,34,10,4);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#9ab0bf';ctx.beginPath();ctx.moveTo(-4,-5);ctx.lineTo(9,-17);ctx.lineTo(12,-5);ctx.closePath();ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();ctx.moveTo(-6,5);ctx.lineTo(8,16);ctx.lineTo(10,5);ctx.closePath();ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#f05d4e';ctx.fillRect(-20,-3,5,6);ctx.restore();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawCursor(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(!cursor.on||cursor.touch||state!=='play'||cursor.x&lt;RAIL)return;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var x=cursor.x,y=cursor.y;ctx.save();ctx.globalAlpha=0.9;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.strokeStyle='rgba(255,255,255,0.38)';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(x,y,PICK_E,0,6.29);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawToolIcon(groundTool,x,y,false);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.restore();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawRain(time){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(rainDur&lt;=0)return;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='rgba(38,56,84,0.14)';ctx.fillRect(0,0,W,H);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.strokeStyle='rgba(155,195,235,0.45)';ctx.lineWidth=1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var n=Math.floor(W*0.16);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;n;i++){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var rx=((i*53.3+time*430)%(W+40))-20;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var ry=((i*87.7+time*640)%(H+40))-20;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();ctx.moveTo(rx,ry);ctx.lineTo(rx-3,ry+11);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawToolIcon(id,cx,cy,locked){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.save();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(id==='water'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>dropIcon(cx,cy);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>} else if(id==='seedling'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.strokeStyle='#9ed084';ctx.lineWidth=1.6;ctx.beginPath();ctx.moveTo(cx,cy+6);ctx.lineTo(cx,cy-2);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#7cc46a';ctx.beginPath();ctx.ellipse(cx-3,cy-1,3,1.7,0.6,0,6.29);ctx.fill();ctx.beginPath();ctx.ellipse(cx+3,cy-1,3,1.7,-0.6,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#f1d0a7';ctx.beginPath();ctx.arc(cx-7,cy+5,3,0,6.29);ctx.fill();ctx.beginPath();ctx.arc(cx+7,cy+5,3,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>} else if(id==='adapt'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#4fb0a6';ctx.beginPath();ctx.moveTo(cx,cy-7);ctx.lineTo(cx-6,cy+5);ctx.lineTo(cx+6,cy+5);ctx.closePath();ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#ffd27a';ctx.beginPath();ctx.arc(cx+5,cy-5,1.8,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>} else if(id==='line'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.strokeStyle='#c8b48a';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(cx+4,cy-8);ctx.lineTo(cx-4,cy+6);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#6b5436';ctx.beginPath();ctx.moveTo(cx-8,cy+7);ctx.lineTo(cx+1,cy+3);ctx.lineTo(cx+4,cy+8);ctx.lineTo(cx-5,cy+10);ctx.closePath();ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>} else if(id==='beetle'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.strokeStyle='#d8e78f';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(cx-7,cy+8);ctx.lineTo(cx+2,cy-6);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#c7e66a';roundRect(cx+1,cy-9,8,10,2);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='rgba(190,235,150,0.55)';ctx.beginPath();ctx.arc(cx-8,cy+7,5,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>} else if(id==='air'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#9fd0ff';roundRect(cx-8,cy-6,16,12,3);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.strokeStyle='#17334a';ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(cx-3,cy-6);ctx.lineTo(cx+5,cy-13);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='#17334a';ctx.beginPath();ctx.arc(cx,cy,3,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(locked){ctx.fillStyle='rgba(0,0,0,0.35)';ctx.beginPath();ctx.arc(cx,cy,15,0,6.29);ctx.fill();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.restore();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawTools(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>toolBtns=[];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='rgba(10,14,12,0.62)';roundRect(6,50,52,H-66,12);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='700 8px system-ui,sans-serif';ctx.fillStyle='rgba(240,245,230,0.78)';ctx.fillText('TOOLS',32,65);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var defs=[</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>{id:'water',sub:DOUSE+'w'},</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>{id:'seedling',sub:PLANT+'w'},</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>{id:'adapt',sub:Math.floor(adaptStock)+'/'+ADAPT_MAX},</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>{id:'line',sub:LINE_COST+'w'},</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>{id:'beetle',sub:VERB_COST+'w'},</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>{id:'air',sub:(score&lt;AIR_UNLOCK?AIR_UNLOCK+'p':(airCD&gt;0?Math.ceil(airCD)+'s':'ready'))}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var y0=76,bw=44,bh=42,gap=7;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;defs.length;i++){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var D=defs[i],bx=10,by=y0+i*(bh+gap),sel=groundTool===D.id,disabled=false;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(D.id==='adapt'&amp;&amp;adaptStock&lt;1)disabled=true;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(D.id==='air'&amp;&amp;(score&lt;AIR_UNLOCK||airCD&gt;0))disabled=true;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>toolBtns.push({x:bx,y:by,w:bw,h:bh,id:D.id});</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle=sel?'rgba(64,116,80,0.92)':(disabled?'rgba(30,34,32,0.72)':'rgba(12,18,14,0.72)');</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>roundRect(bx,by,bw,bh,8);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(sel){ctx.strokeStyle='rgba(185,232,175,0.95)';ctx.lineWidth=1.5;roundRect(bx,by,bw,bh,8);ctx.stroke();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>drawToolIcon(D.id,bx+bw/2,by+15,disabled);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.font='600 8px system-ui,sans-serif';ctx.fillStyle=disabled?'#c9a96a':'#eaf6d8';ctx.fillText(D.sub,bx+bw/2,by+32);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.textAlign='left';ctx.textBaseline='alphabetic';ctx.font='500 12px system-ui,sans-serif';ctx.fillStyle='rgba(230,240,220,0.82)';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var hint=groundTool==='water'?'Water: douse fires, clear snags':groundTool==='seedling'?'Seed: tap open ground':groundTool==='adapt'?'Climate: uses seedling stock':groundTool==='line'?'Line: dig a firebreak':groundTool==='beetle'?'Beetle: spray verbenone':'Air: click radio to call tanker';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText(hint,RAIL+12,H-14);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawParts(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;parts.length;i++){var p=parts[i];var k=p.t/p.life;var a=1-k;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(p.type==='flame'){ctx.globalCompositeOperation='lighter';var c=mixc([255,210,90],[255,70,20],k);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.fillStyle=rgba(c,a);ctx.beginPath();ctx.arc(p.x,p.y,Math.max(0.4,p.r*(1-k*0.6)),0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.globalCompositeOperation='source-over';}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='tail'){ctx.globalCompositeOperation='lighter';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.fillStyle='rgba(255,160,60,'+(a*0.6)+')';ctx.fillRect(p.x,p.y,2,2);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.globalCompositeOperation='source-over';}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='smoke'){ctx.fillStyle='rgba(120,118,114,'+(a*0.35)+')';ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,6.29);ctx.fill();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='drop'){ctx.fillStyle='rgba(110,190,255,'+a+')';ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,6.29);ctx.fill();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='spark'){ctx.fillStyle='rgba(255,230,130,'+a+')';ctx.fillRect(p.x,p.y,p.r+1,p.r+1);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='dirt'){ctx.fillStyle='rgba(92,66,40,'+a+')';ctx.fillRect(p.x,p.y,p.r+1,p.r+1);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='frass'){ctx.fillStyle='rgba(150,98,50,'+(a*0.8)+')';ctx.fillRect(p.x,p.y,p.r,p.r);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='needle'){ctx.save();ctx.translate(p.x,p.y);ctx.rotate((p.rot||0)+p.t*6);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.strokeStyle='rgba(110,150,84,'+a+')';ctx.lineWidth=1.4;ctx.beginPath();ctx.moveTo(-p.r,0);ctx.lineTo(p.r,0);ctx.stroke();ctx.restore();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='chip'){ctx.fillStyle='rgba(206,180,140,'+a+')';ctx.fillRect(p.x,p.y,p.r+1,p.r);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='retard'){ctx.fillStyle='rgba(230,92,86,'+(a*0.8)+')';ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,6.29);ctx.fill();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='haze'){ctx.fillStyle='rgba(170,220,120,'+(a*0.22)+')';ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,6.29);ctx.fill();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else if(p.type==='ring'){ctx.strokeStyle='rgba(150,210,255,'+a+')';ctx.lineWidth=2;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.beginPath();ctx.arc(p.x,p.y,4+k*26,0,6.29);ctx.stroke();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawFloats(){ctx.textAlign='center';ctx.font='500 14px system-ui,sans-serif';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;floats.length;i++){var f=floats[i];ctx.fillStyle=f.col;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.globalAlpha=Math.max(0,1-f.t/0.95);ctx.fillText(f.txt,f.x,f.y);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.globalAlpha=1;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function dropIcon(x,y){ctx.fillStyle='#5db8ee';ctx.beginPath();ctx.moveTo(x,y-7);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.bezierCurveTo(x+7,y+2,x+4,y+7,x,y+7);ctx.bezierCurveTo(x-4,y+7,x-7,y+2,x,y-7);ctx.fill();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function speaker(x,y,m){ctx.fillStyle='#f4f1e6';ctx.beginPath();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.moveTo(x-8,y-3);ctx.lineTo(x-3,y-3);ctx.lineTo(x+2,y-8);ctx.lineTo(x+2,y+8);ctx.lineTo(x-3,y+3);ctx.lineTo(x-8,y+3);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.closePath();ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(m){ctx.strokeStyle='#ff9b7a';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(x+5,y-7);ctx.lineTo(x+12,y+7);ctx.stroke();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else{ctx.strokeStyle='#f4f1e6';ctx.lineWidth=1.5;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();ctx.arc(x+4,y,5,-0.9,0.9);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.beginPath();ctx.arc(x+4,y,8,-0.9,0.9);ctx.stroke();}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawHUD(){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='rgba(12,18,14,0.42)';roundRect(RAIL+8,8,W-RAIL-16,36,10);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.textAlign='left';ctx.textBaseline='middle';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#f4f1e6';ctx.font='500 14px system-ui,sans-serif';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Score '+score,RAIL+20,27);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var narrow=W&lt;480;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var waterX=narrow?RAIL+104:RAIL+150;var bw=narrow?56:76;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>dropIcon(waterX,26);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='rgba(255,255,255,0.18)';roundRect(waterX+12,20,bw,12,6);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#5db8ee';roundRect(waterX+12,20,Math.max(1,bw*(water/WMAX)),12,6);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var windX=waterX+12+bw+16;var axx;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(!narrow){ctx.fillStyle='#f4f1e6';ctx.fillText('Wind',windX,27);axx=windX+62;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>else axx=windX+26;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var aw=wind*24;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.strokeStyle='#f4f1e6';ctx.lineWidth=2;ctx.lineCap='round';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.beginPath();ctx.moveTo(axx-aw,26);ctx.lineTo(axx+aw,26);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var dir=wind&gt;=0?1:-1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.beginPath();ctx.moveTo(axx+aw,26);ctx.lineTo(axx+aw-6*dir,22);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.moveTo(axx+aw,26);ctx.lineTo(axx+aw-6*dir,30);ctx.stroke();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var live=0;for(var i=0;i&lt;trees.length;i++)if(trees[i].state!=='burned')live++;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var tx=W-84;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.beginPath();ctx.moveTo(tx,18);ctx.lineTo(tx-6,33);ctx.lineTo(tx+6,33);ctx.closePath();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#9ed084';ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#f4f1e6';ctx.fillText(''+live,tx+12,27);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>muteBox={x:W-46,y:10,w:34,h:32};</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>speaker(W-34,26,muted);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.textBaseline='alphabetic';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function dim(){ctx.fillStyle='rgba(8,12,10,0.55)';ctx.fillRect(0,0,W,H);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function pulse(txt,y){ctx.font='500 16px system-ui,sans-serif';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='rgba(255,220,140,'+(0.6+0.4*Math.sin(performance.now()/300))+')';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText(txt,W/2,y);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawMenu(){dim();ctx.textAlign='center';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#fff4dd';ctx.font='500 34px system-ui,sans-serif';ctx.fillText('Emberfall',W/2,H*0.2);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.font='400 13px system-ui,sans-serif';ctx.fillStyle='#e8e3d2';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('The sky is dropping fire on your forest.',W/2,H*0.2+26);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#cfe6c0';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var ly=H*0.36,dy=20;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Tap embers and beetles to swat them.',W/2,ly);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Use the side toolkit: water, seed, climate, line, beetle, air.',W/2,ly+dy);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Climate seedlings refill over time and resist fire and insects.',W/2,ly+dy*2);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Verbenone repels beetles; air support unlocks at '+AIR_UNLOCK+' points.',W/2,ly+dy*3);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Snags breed beetles (swat them; woodpeckers help).',W/2,ly+dy*4);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Survivors fling cones to reseed the burns.',W/2,ly+dy*5);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Rain brings relief. Fire builds with time. Mind the wind.',W/2,ly+dy*6);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>pulse('Tap to start',ly+dy*6+34);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function drawOver(){dim();ctx.textAlign='center';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#ffb38a';ctx.font='500 28px system-ui,sans-serif';ctx.fillText('The forest is gone',W/2,H*0.28);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.font='400 13px system-ui,sans-serif';ctx.fillStyle='#e8e3d2';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Survived '+Math.floor(elapsed)+' seconds',W/2,H*0.28+28);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle='#cfe6c0';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Doused '+doused+' <span class="Apple-converted-space">  </span>· <span class="Apple-converted-space">  </span>Beetles '+swatted+' <span class="Apple-converted-space">  </span>· <span class="Apple-converted-space">  </span>Cones '+reseeded,W/2,H*0.28+47);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Planted '+planted+' <span class="Apple-converted-space">  </span>· <span class="Apple-converted-space">  </span>Climate trees '+adaptPlanted+' <span class="Apple-converted-space">  </span>· <span class="Apple-converted-space">  </span>Lines '+lineBuilt,W/2,H*0.28+65);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillText('Verbenone '+sprayed+' <span class="Apple-converted-space">  </span>· <span class="Apple-converted-space">  </span>Air drops '+airdrops,W/2,H*0.28+83);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.font='500 20px system-ui,sans-serif';ctx.fillStyle='#fff4dd';ctx.fillText('Score '+score,W/2,H*0.52);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.font='400 13px system-ui,sans-serif';ctx.fillStyle='#cfc9b8';ctx.fillText('Best this session: '+best,W/2,H*0.52+24);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>pulse('Tap to replant',H*0.52+62);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function draw(time){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.setTransform(DPR,0,0,DPR,0,0);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(shake&gt;0)ctx.translate(rnd(-shake,shake)*0.5,rnd(-shake,shake)*0.5);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var tday=(elapsed%64)/64;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var light=0.5+0.5*Math.cos(tday*Math.PI*2);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var top=mixc([13,23,51],[126,178,224],light);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var bot=mixc([28,36,56],[214,233,219],light);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var dusk=1-Math.abs(light-0.5)*2;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>bot=mixc(bot,[244,162,97],dusk*0.45);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var g=ctx.createLinearGradient(0,0,0,H);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>g.addColorStop(0,rgba(top,1));g.addColorStop(1,rgba(bot,1));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle=g;ctx.fillRect(0,0,W,H);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var dark=clamp((0.55-light)*2.2,0,1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(dark&gt;0){ctx.fillStyle='#ffffff';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>for(var i=0;i&lt;stars.length;i++){var st=stars[i];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.globalAlpha=dark*(0.4+0.6*Math.abs(Math.sin(time*1.5+st.p)));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.fillRect(st.x,st.y,1.6,1.6);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.globalAlpha=1;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var horizon=H-120;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var sa=(tday+0.5)%1;var sx=W*sa,sy=horizon-Math.sin(sa*Math.PI)*(H*0.45);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.globalAlpha=clamp(light*1.4-0.2,0,1);ctx.fillStyle='#ffd97a';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.beginPath();ctx.arc(sx,sy,16,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var mx=W*tday,my=horizon-Math.sin(tday*Math.PI)*(H*0.45);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.globalAlpha=dark;ctx.fillStyle='#e8ecf4';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.beginPath();ctx.arc(mx,my,11,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.globalAlpha=1;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawRidge(H-160,26,0.006,mixc([40,62,84],[122,158,170],light),2.2);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawRidge(H-118,20,0.009,mixc([30,48,62],[88,128,134],light),5.1);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var gcol=mixc([26,42,30],[88,128,74],light);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.fillStyle=rgba(gcol,1);ctx.beginPath();ctx.moveTo(0,H);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var gx=0;gx&lt;=W;gx+=6)ctx.lineTo(gx,groundY(gx));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.lineTo(W,H);ctx.closePath();ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawVerbs();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawLines();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var ti=0;ti&lt;trees.length;ti++)drawTree(trees[ti],time,light);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.globalCompositeOperation='lighter';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var k=0;k&lt;embers.length;k++){var e=embers[k];var fl=0.7+0.3*Math.sin(time*20+e.x);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='rgba(255,140,40,0.35)';ctx.beginPath();ctx.arc(e.x,e.y,e.r*3*fl,0,6.29);ctx.fill();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>ctx.fillStyle='rgba(255,220,120,0.95)';ctx.beginPath();ctx.arc(e.x,e.y,e.r*fl,0,6.29);ctx.fill();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>ctx.globalCompositeOperation='source-over';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawParts();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawCones();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawBeetles(time);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawPlanes();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawWoodpeckers();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawRain(time);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawFloats();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawHUD();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(state==='play')drawTools();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(state==='play'){var byb=112;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(showerWarn&gt;0){ctx.textAlign='center';ctx.fillStyle='rgba(255,120,60,'+(0.5+0.5*Math.sin(time*14))+')';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.font='500 15px system-ui,sans-serif';ctx.fillText('Ember shower incoming',W/2,byb);byb+=22;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(outbreakWarn&gt;0){ctx.textAlign='center';ctx.fillStyle='rgba(180,110,60,'+(0.5+0.5*Math.sin(time*12))+')';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.font='500 15px system-ui,sans-serif';ctx.fillText('Beetle outbreak in the snags',W/2,byb);byb+=22;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(rainWarn&gt;0||rainDur&gt;0){ctx.textAlign='center';ctx.fillStyle='rgba(150,195,235,'+(0.55+0.45*Math.sin(time*9))+')';</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>ctx.font='500 15px system-ui,sans-serif';ctx.fillText(rainDur&gt;0?'Rain':'Rain moving in',W/2,byb);byb+=22;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(state==='menu')drawMenu();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(state==='over')drawOver();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>drawCursor();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>cv.addEventListener('pointerdown',function(e){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>e.preventDefault();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var r=cv.getBoundingClientRect();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var x=(e.clientX-r.left)*(W/r.width),y=(e.clientY-r.top)*(H/r.height);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>cursor.x=x;cursor.y=y;cursor.on=true;cursor.touch=(e.pointerType==='touch');</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>audio();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(x&gt;=muteBox.x&amp;&amp;x&lt;=muteBox.x+muteBox.w&amp;&amp;y&gt;=muteBox.y&amp;&amp;y&lt;=muteBox.y+muteBox.h&amp;&amp;state!=='menu'){muted=!muted;return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(state==='menu'||state==='over'){reset();return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var ti2=0;ti2&lt;toolBtns.length;ti2++){var B=toolBtns[ti2];</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(x&gt;=B.x&amp;&amp;x&lt;=B.x+B.w&amp;&amp;y&gt;=B.y&amp;&amp;y&lt;=B.y+B.h){if(B.id==='air'){requestPlane();}else{groundTool=B.id;sfxTick();}return;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var bi=-1,bd=PICK_E;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var i=0;i&lt;embers.length;i++){var d=Math.hypot(embers[i].x-x,embers[i].y-y);if(d&lt;bd){bd=d;bi=i;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(bi&gt;=0){var em=embers[bi];embers.splice(bi,1);addScore(5,em.x,em.y);burst(em.x,em.y,6,'spark');sfxSwat();return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var ci=-1,cd=PICK_B;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var bj=0;bj&lt;beetles.length;bj++){var bdh=Math.hypot(beetles[bj].x-x,beetles[bj].y-y);if(bdh&lt;cd){cd=bdh;ci=bj;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(ci&gt;=0){var bb=beetles[ci];killBeetle(bb,bb.x,bb.y);return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var tiB=-1,td=1e9;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>for(var j=0;j&lt;trees.length;j++){var t=trees[j];if(t.state!=='burning')continue;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var hh=t.h*t.s;var cx=t.x,cy=t.gy-hh*0.55;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var d2=Math.hypot(cx-x,cy-y);var rad=Math.max(30,hh*0.55);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(d2&lt;rad&amp;&amp;d2&lt;td){td=d2;tiB=j;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(tiB&gt;=0&amp;&amp;groundTool==='water'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(water&gt;=DOUSE){water-=DOUSE;douse(trees[tiB]);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else{floats.push({x:x,y:y,txt:'No water',t:0,col:'#ff9b7a'});sfxDeny();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(groundTool==='water'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var snag=-1,sd=PICK_B;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>for(var sj=0;sj&lt;trees.length;sj++){var st=trees[sj];if(st.state!=='burned')continue;var sh=st.h*st.s;var dd=Math.hypot(st.x-x,(st.gy-sh*0.35)-y);if(dd&lt;sd){sd=dd;snag=sj;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(snag&gt;=0){if(water&gt;=WET_COST){water-=WET_COST;var sx=trees[snag].x,sy=trees[snag].gy;trees.splice(snag,1);burst(sx,sy-18,9,'chip');sfxThud();}else{sfxDeny();}return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>var gy=groundY(x);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>if(y&gt;gy-46&amp;&amp;x&gt;RAIL+14&amp;&amp;x&lt;W-14){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(groundTool==='line'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(water&gt;=LINE_COST){if(buildLine(x)){water-=LINE_COST;lineBuilt++;sfxPlant();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">    </span>else{floats.push({x:x,y:y-8,txt:'Too close',t:0,col:'#cfc9b8'});sfxDeny();}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>else{floats.push({x:x,y:y-8,txt:'No water',t:0,col:'#ff9b7a'});sfxDeny();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(groundTool==='beetle'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(water&gt;=VERB_COST){water-=VERB_COST;deployVerb(x);floats.push({x:x,y:y-8,txt:'Verbenone',t:0,col:'#c7e66a'});}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>else{floats.push({x:x,y:y-8,txt:'No water',t:0,col:'#ff9b7a'});sfxDeny();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(groundTool==='water'){parts.push(P(x,Math.min(y,gy),'ring'));return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>var ok=true;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>for(var n=0;n&lt;trees.length;n++){if(trees[n].state!=='burned'&amp;&amp;Math.abs(trees[n].x-x)&lt;30){ok=false;break;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(!ok){parts.push(P(x,Math.min(y,gy),'ring'));return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>for(var m=trees.length-1;m&gt;=0;m--){if(trees[m].state==='burned'&amp;&amp;Math.abs(trees[m].x-x)&lt;18){trees.splice(m,1);break;}}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(groundTool==='adapt'){</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(adaptStock&lt;1){floats.push({x:x,y:y-8,txt:'No climate seedlings',t:0,col:'#ffd27a'});sfxDeny();return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>if(water&lt;PLANT){floats.push({x:x,y:y-8,txt:'No water',t:0,col:'#ff9b7a'});sfxDeny();return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>adaptStock--;water-=PLANT;addTreeAt(x,0.1,true);adaptPlanted++;</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>burst(x,gy-4,10,'dirt');burst(x,gy-12,5,'spark');sfxPlant();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">   </span>return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>if(water&gt;=PLANT){water-=PLANT;addTreeAt(x,0.1,false);planted++;burst(x,gy-4,8,'dirt');sfxPlant();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>else{floats.push({x:x,y:y-8,txt:'No water',t:0,col:'#ff9b7a'});sfxDeny();}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space">  </span>return;}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b><span class="Apple-converted-space"> </span>parts.push(P(x,y,'ring'));</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>});</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>cv.addEventListener('pointermove',function(e){var r=cv.getBoundingClientRect();cursor.x=(e.clientX-r.left)*(W/r.width);cursor.y=(e.clientY-r.top)*(H/r.height);cursor.on=true;cursor.touch=(e.pointerType==='touch');});</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>cv.addEventListener('pointerleave',function(){cursor.on=false;});</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000; min-height: 23.0px"><span class="s1"><b></b></span><br></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>initForest();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>var last=performance.now();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>function frame(now){var dt=Math.min(0.033,(now-last)/1000);last=now;update(dt);draw(now/1000);requestAnimationFrame(frame);}</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>requestAnimationFrame(frame);</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>})();</b></span></h2>
+<h2 style="margin: 0.0px 0.0px 14.9px 0.0px; font: 18.0px Times; -webkit-text-stroke: #000000"><span class="s1"><b>&lt;/script&gt;</b></span></h2>
+<p class="p3"><span class="s1"></span><br></p>
+</body>
+</html>
